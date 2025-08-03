@@ -1,0 +1,22 @@
+{
+  "family": "symfony-app-task",
+  "networkMode": "awsvpc",
+  "containerDefinitions": [
+    {
+      "name": "symfony-app-container",
+      "image": "PLACEHOLDER_IMAGE_URI",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8000,
+          "hostPort": 8000,
+          "protocol": "tcp"
+        }
+      ]
+    }
+  ],
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/symfony-app-task-exec-role"
+}
