@@ -1,3 +1,4 @@
+// Triggering ECS deploy via GitHub Actions test
 <?php
 
 use App\Kernel;
