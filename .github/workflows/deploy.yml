@@ -36,17 +36,22 @@ jobs:
         env:
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          IMAGE_URI="${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG"
+          IMAGE_URI="${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG"
           docker build -t "$IMAGE_URI" ./symfony-app
           docker push "$IMAGE_URI"
           echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
 
-          
-      - name: Update ECS service
+      - name: Render ECS task definition
+        id: render-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: symfony-app-container
+          image: ${{ env.IMAGE_URI }}
+
+      - name: Deploy to ECS
         uses: aws-actions/amazon-ecs-deploy-task-definition@v1
         with:
           service: ${{ secrets.ECS_SERVICE }}
           cluster: ${{ secrets.ECS_CLUSTER }}
-          task-definition: ${{ secrets.ECS_TASK_DEF_NAME }}
-          force-new-deployment: true
-
+          task-definition: ${{ steps.render-task-def.outputs.task-definition }}
