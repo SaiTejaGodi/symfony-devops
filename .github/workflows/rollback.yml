@@ -1,10 +1,15 @@
-name: Rollback ECS to previous revision
+name: Rollback ECS to specific image
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "ECR image tag to roll back to (e.g. commit SHA or 'stable')"
+        required: true
 
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
   ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
   ECS_SERVICE: ${{ secrets.ECS_SERVICE }}
 
@@ -14,61 +19,42 @@ jobs:
     environment: aws_creds
 
     steps:
+      - name: Checkout source
+        uses: actions/checkout@v3
+
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v2
         with:
-          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region:            ${{ env.AWS_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: Find previous task definition
-        id: find-prev
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Set IMAGE_URI for rollback
         run: |
-          set -euo pipefail
-          CUR_TD=$(aws ecs describe-services \
-            --cluster "$ECS_CLUSTER" \
-            --services "$ECS_SERVICE" \
-            --query 'services[0].taskDefinition' \
-            --output text)
+          IMAGE_URI="${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.event.inputs.image_tag }}"
+          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
 
-          FAMILY=$(aws ecs describe-task-definition \
-            --task-definition "$CUR_TD" \
-            --query 'taskDefinition.family' \
-            --output text)
+      - name: Render ECS task definition
+        id: render-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: symfony-app-container
+          image: ${{ env.IMAGE_URI }}
 
-          PREV_TD=$(aws ecs list-task-definitions \
-            --family-name "$FAMILY" \
-            --status ACTIVE \
-            --sort DESC \
-            --query 'taskDefinitionArns[1]' \
-            --output text)
-
-          if [[ -z "$PREV_TD" || "$PREV_TD" == "None" ]]; then
-            echo "No previous active task definition found for family $FAMILY"
-            exit 1
-          fi
-
-          echo "PREV_TD=$PREV_TD" >> $GITHUB_ENV
-          echo "Rolling back from $CUR_TD to $PREV_TD"
-
-      - name: Rollback to previous task definition
+      - name: Retry ECS deployment (AWS CLI)
         uses: nick-invision/retry@v2
         with:
-          max_attempts: 3
           timeout_minutes: 5
+          max_attempts: 3
           command: |
             aws ecs update-service \
               --cluster ${{ env.ECS_CLUSTER }} \
               --service ${{ env.ECS_SERVICE }} \
-              --task-definition "${{ env.PREV_TD }}" \
               --force-new-deployment \
               --region ${{ env.AWS_REGION }}
-
-      - name: Wait for stability
-        run: |
-          aws ecs wait services-stable \
-            --cluster "${{ env.ECS_CLUSTER }}" \
-            --services "${{ env.ECS_SERVICE }}" \
-            --region "${{ env.AWS_REGION }}"
-          echo "Rollback complete ✅"
 
