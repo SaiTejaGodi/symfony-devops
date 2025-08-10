@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: "ECR image tag to roll back to (e.g., previous commit SHA or 'stable')"
+        description: "ECR image tag to roll back to (e.g., commit SHA or 'stable')"
         required: true
 
 env:
@@ -18,10 +18,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -29,11 +29,19 @@ jobs:
 
       - name: Login to ECR
         id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v1
+        uses: aws-actions/amazon-ecr-login@v2
 
       - name: Set IMAGE_URI for rollback
         run: |
           echo "IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ github.event.inputs.image_tag }}" >> $GITHUB_ENV
+          echo "AWS_RETRY_MODE=adaptive" >> $GITHUB_ENV
+          echo "AWS_MAX_ATTEMPTS=15" >> $GITHUB_ENV
+
+      - name: (Optional) Verify image exists in ECR
+        run: |
+          aws ecr describe-images \
+            --repository-name "${{ secrets.ECR_REPOSITORY }}" \
+            --image-ids imageTag="${{ github.event.inputs.image_tag }}" >/dev/null
 
       - name: Render ECS task definition
         id: render-task-def
@@ -46,26 +54,41 @@ jobs:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Register rendered task definition
-        id: register-td
-        run: |
-          RENDERED="${{ steps.render-task-def.outputs.task-definition }}"
-          REGISTER_OUT=$(aws ecs register-task-definition \
-            --cli-input-json "file://$RENDERED" \
-            --region "${{ secrets.AWS_REGION }}")
-          NEW_TD_ARN=$(echo "$REGISTER_OUT" | jq -r '.taskDefinition.taskDefinitionArn')
-          echo "NEW_TD_ARN=$NEW_TD_ARN" >> $GITHUB_ENV
+      # Register with retries to ride out ECS 5xx
+      - name: Register rendered task definition (retryable)
+        uses: nick-invision/retry@v2
+        env:
+          RENDERED: ${{ steps.render-task-def.outputs.task-definition }}
+        with:
+          max_attempts: 5
+          timeout_minutes: 10
+          command: |
+            set -euo pipefail
+            REGISTER_OUT=$(aws ecs register-task-definition \
+              --cli-input-json "file://$RENDERED" \
+              --region "${{ env.AWS_REGION }}" \
+              --no-cli-pager --output json)
+            NEW_TD_ARN=$(echo "$REGISTER_OUT" | jq -r '.taskDefinition.taskDefinitionArn')
+            echo "NEW_TD_ARN=$NEW_TD_ARN" | tee -a "$GITHUB_ENV"
 
       - name: Deploy rollback to ECS (retryable)
         uses: nick-invision/retry@v2
         with:
-          timeout_minutes: 5
-          max_attempts: 3
+          timeout_minutes: 10
+          max_attempts: 5
           command: |
             aws ecs update-service \
               --cluster ${{ secrets.ECS_CLUSTER }} \
               --service ${{ secrets.ECS_SERVICE }} \
               --task-definition "${{ env.NEW_TD_ARN }}" \
               --force-new-deployment \
-              --region ${{ secrets.AWS_REGION }}
+              --region ${{ env.AWS_REGION }}
+
+      - name: Wait for service stability
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ secrets.ECS_CLUSTER }} \
+            --services ${{ secrets.ECS_SERVICE }} \
+            --region ${{ env.AWS_REGION }}
+          echo "Rollback complete ✅"
 
