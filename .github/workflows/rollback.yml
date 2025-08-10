@@ -1,0 +1,71 @@
+name: Rollback ECS to previous image
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "ECR image tag to roll back to (e.g., previous commit SHA or 'stable')"
+        required: true
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    environment: aws_creds
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Set IMAGE_URI for rollback
+        run: |
+          echo "IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ github.event.inputs.image_tag }}" >> $GITHUB_ENV
+
+      - name: Render ECS task definition
+        id: render-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: symfony-app-container
+          image: ${{ env.IMAGE_URI }}
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Register rendered task definition
+        id: register-td
+        run: |
+          RENDERED="${{ steps.render-task-def.outputs.task-definition }}"
+          REGISTER_OUT=$(aws ecs register-task-definition \
+            --cli-input-json "file://$RENDERED" \
+            --region "${{ secrets.AWS_REGION }}")
+          NEW_TD_ARN=$(echo "$REGISTER_OUT" | jq -r '.taskDefinition.taskDefinitionArn')
+          echo "NEW_TD_ARN=$NEW_TD_ARN" >> $GITHUB_ENV
+
+      - name: Deploy rollback to ECS (retryable)
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 5
+          max_attempts: 3
+          command: |
+            aws ecs update-service \
+              --cluster ${{ secrets.ECS_CLUSTER }} \
+              --service ${{ secrets.ECS_SERVICE }} \
+              --task-definition "${{ env.NEW_TD_ARN }}" \
+              --force-new-deployment \
+              --region ${{ secrets.AWS_REGION }}
+
